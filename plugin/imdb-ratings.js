@@ -252,19 +252,76 @@
             onChange: resetPlugin
         });
     }
-
+    
     function registerSettings() {
         if (!Lampa.SettingsApi) return;
-
+    
         Lampa.SettingsApi.addComponent({
             component: COMPONENT,
             name: 'IMDb Ratings',
-            icon: '<svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2" fill="currentColor"/></svg>'
+            icon:
+                '<svg viewBox="0 0 24 24">' +
+                '<rect x="2" y="5" width="20" height="14" rx="2" fill="currentColor"/>' +
+                '</svg>'
         });
-        addSetting(SETTINGS.url, 'input', '', 'Rating service URL', 'For example: https://ratings.example.com');
-        addSetting(SETTINGS.token, 'input', '', 'Service token', 'Sent to the rating service as X-Api-Key');
-        addSetting(SETTINGS.enabled, 'trigger', true, 'Use IMDb ratings', 'Replace poster ratings with IMDb ratings');
-        addSetting(SETTINGS.label, 'trigger', false, 'Show IMDb label', 'Display IMDb 8.4 instead of 8.4');
+    
+        Lampa.SettingsApi.addParam({
+            component: COMPONENT,
+            param: {
+                name: SETTINGS.url,
+                type: 'input',
+                values: '',
+                default: ''
+            },
+            field: {
+                name: 'Rating service URL',
+                description: 'For example: https://ratings.example.com'
+            },
+            onChange: resetPlugin
+        });
+    
+        Lampa.SettingsApi.addParam({
+            component: COMPONENT,
+            param: {
+                name: SETTINGS.token,
+                type: 'input',
+                values: '',
+                default: ''
+            },
+            field: {
+                name: 'Service token',
+                description: 'Sent to the rating service as X-Api-Key'
+            },
+            onChange: resetPlugin
+        });
+    
+        Lampa.SettingsApi.addParam({
+            component: COMPONENT,
+            param: {
+                name: SETTINGS.enabled,
+                type: 'trigger',
+                default: true
+            },
+            field: {
+                name: 'Use IMDb ratings',
+                description: 'Replace poster ratings with IMDb ratings'
+            },
+            onChange: resetPlugin
+        });
+    
+        Lampa.SettingsApi.addParam({
+            component: COMPONENT,
+            param: {
+                name: SETTINGS.label,
+                type: 'trigger',
+                default: false
+            },
+            field: {
+                name: 'Show IMDb label',
+                description: 'Display IMDb 8.4 instead of 8.4'
+            },
+            onChange: resetPlugin
+        });
     }
 
     function observeCards() {
