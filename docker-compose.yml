@@ -1,0 +1,16 @@
+services:
+  imdb-ratings:
+    build: ./Server
+    container_name: imdb-ratings
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      TMDB_TOKEN: "${TMDB_TOKEN:-}"
+      SERVICE_TOKEN: "${SERVICE_TOKEN:?Set SERVICE_TOKEN in .env}"
+      REFRESH_UTC_HOUR: "${REFRESH_UTC_HOUR:-16}"
+      MINIMUM_RATING_ROWS: "${MINIMUM_RATING_ROWS:-100000}"
+      TMDB_MISS_CACHE_HOURS: "${TMDB_MISS_CACHE_HOURS:-24}"
+      DATA_DIR: "/data"
+    volumes:
+      - ./data:/data
