@@ -3,11 +3,12 @@
 var assert = require('assert');
 var path = require('path');
 
-function Element(classNames) {
+function Element(classNames, tagName) {
     var element = this;
     var classes = (classNames || '').split(/\s+/).filter(Boolean);
 
     this.nodeType = 1;
+    this.tagName = String(tagName || 'div').toUpperCase();
     this.attributes = {};
     this.children = [];
     this.parentNode = null;
@@ -49,9 +50,10 @@ Element.prototype.removeChild = function (child) {
     child.parentNode = null;
 };
 Element.prototype.querySelector = function (selector) {
-    var className = selector.charAt(0) === '.' ? selector.slice(1) : '';
+    var isClass = selector.charAt(0) === '.';
+    var name = isClass ? selector.slice(1) : selector.toUpperCase();
     for (var i = 0; i < this.children.length; i++) {
-        if (this.children[i].classList.contains(className)) return this.children[i];
+        if (isClass ? this.children[i].classList.contains(name) : this.children[i].tagName === name) return this.children[i];
         var nested = this.children[i].querySelector(selector);
         if (nested) return nested;
     }
@@ -99,6 +101,19 @@ function createDetail(rating) {
     return { body: body, root: root, tmdb: tmdb, imdb: imdb, imdbValue: imdbValue };
 }
 
+function createTorrentDetail(rating) {
+    var body = new Element('activity-body');
+    var root = new Element('explorer');
+    var rate = new Element('explorer-card__head-rate');
+    var value = new Element('', 'span');
+
+    value.innerText = rating;
+    rate.appendChild(value);
+    root.appendChild(rate);
+    body.appendChild(root);
+    return { body: body, root: root, rate: rate, value: value };
+}
+
 function delay(milliseconds) {
     return new Promise(function (resolve) { setTimeout(resolve, milliseconds); });
 }
@@ -111,6 +126,8 @@ function delay(milliseconds) {
     var fetchAttempts = 0;
     var requestBodies = [];
     var fullListeners = [];
+    var activityListeners = [];
+    var activeActivity = null;
     var settings = {
         imdb_batch_url: 'https://ratings.example.com',
         imdb_batch_token: 'test-token',
@@ -120,6 +137,7 @@ function delay(milliseconds) {
     var valid = createCard({ id: 278, media_type: 'movie' }, '8.0', 'TMDB rating');
     var invalid = createCard({ id: 'custom-card', media_type: 'movie' }, '7.0');
     var detail = createDetail('8.0');
+    var torrentDetail = createTorrentDetail('8.0');
     var cards = [valid.card, invalid.card];
 
     global.window = {};
@@ -127,14 +145,15 @@ function delay(milliseconds) {
         body: new Element('body'),
         documentElement: {
             contains: function (element) {
-                return cards.indexOf(element) !== -1 || element === detail.root;
+                return cards.indexOf(element) !== -1 || element === detail.root || element === torrentDetail.root;
             }
         },
         readyState: 'complete',
-        createElement: function () { return new Element(); },
+        createElement: function (tagName) { return new Element('', tagName); },
         querySelectorAll: function (selector) {
             if (selector === '.card') return cards;
             if (selector === '.full-start-new') return [detail.root];
+            if (selector === '.explorer') return [torrentDetail.root];
             return [];
         },
         addEventListener: function () {}
@@ -165,9 +184,13 @@ function delay(milliseconds) {
         },
         Listener: {
             follow: function (name, listener) {
-                assert.strictEqual(name, 'full');
-                fullListeners.push(listener);
+                if (name === 'full') fullListeners.push(listener);
+                else if (name === 'activity') activityListeners.push(listener);
+                else assert.fail('Unexpected listener: ' + name);
             }
+        },
+        Activity: {
+            active: function () { return activeActivity; }
         }
     };
     window.Lampa = global.Lampa;
@@ -196,6 +219,7 @@ function delay(milliseconds) {
     assert.ok(componentIcon.indexOf('<rect') === -1, 'Settings must not use the placeholder icon');
     assert.strictEqual(registeredParams.length, 4, 'Startup retry must not duplicate settings');
     assert.strictEqual(fullListeners.length, 1, 'Startup retry must not duplicate the full-screen listener');
+    assert.strictEqual(activityListeners.length, 1, 'Startup retry must not duplicate the activity listener');
     assert.strictEqual(observerAttempts, 2, 'Observer startup should be retried once');
     assert.strictEqual(fetchAttempts, 2, 'A transient network error should be retried');
     assert.strictEqual(requestBodies[0].items.length, 1, 'Invalid card IDs must not enter the batch');
@@ -216,6 +240,16 @@ function delay(milliseconds) {
     assert.strictEqual(detail.imdbValue.innerText, '9.3');
     assert.strictEqual(detail.imdb.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
 
+    activeActivity = {
+        component: 'torrents',
+        movie: { id: 278, media_type: 'movie' },
+        activity: { render: function () { return { 0: torrentDetail.body }; } }
+    };
+    activityListeners[0]({ type: 'start', object: activeActivity });
+
+    assert.strictEqual(torrentDetail.value.innerText, '9.3', 'Torrent details must show the IMDb rating');
+    assert.strictEqual(torrentDetail.rate.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
+
     settings.imdb_batch_enabled = false;
     registeredParams.find(function (entry) {
         return entry.param.name === 'imdb_batch_enabled';
@@ -227,6 +261,8 @@ function delay(milliseconds) {
     assert.strictEqual(detail.tmdb.classList.contains('hide'), false, 'Disabling must restore TMDB in details');
     assert.strictEqual(detail.imdb.classList.contains('hide'), true, 'Disabling must restore the hidden IMDb block');
     assert.strictEqual(detail.imdbValue.innerText, '');
+    assert.strictEqual(torrentDetail.value.innerText, '8.0', 'Disabling must restore TMDB in torrent details');
+    assert.strictEqual(torrentDetail.rate.hasAttribute('title'), false);
 
     console.log('Plugin compatibility tests passed.');
 })().catch(function (error) {

@@ -27,7 +27,13 @@
         detailOriginalHidden: 'data-imdb-detail-original-hidden',
         detailOriginalText: 'data-imdb-detail-original-text',
         detailOriginalTitle: 'data-imdb-detail-original-title',
-        detailOriginalHadTitle: 'data-imdb-detail-original-had-title'
+        detailOriginalHadTitle: 'data-imdb-detail-original-had-title',
+        torrentLoading: 'data-imdb-torrent-loading',
+        torrentLoaded: 'data-imdb-torrent-loaded',
+        torrentOriginalHidden: 'data-imdb-torrent-original-hidden',
+        torrentOriginalText: 'data-imdb-torrent-original-text',
+        torrentOriginalTitle: 'data-imdb-torrent-original-title',
+        torrentOriginalHadTitle: 'data-imdb-torrent-original-had-title'
     };
     var CARD_SELECTOR = '.card';
     var BATCH_DELAY_MS = 120;
@@ -45,7 +51,8 @@
         componentRegistered: false,
         registeredSettings: {},
         observer: null,
-        fullListenerRegistered: false
+        fullListenerRegistered: false,
+        activityListenerRegistered: false
     };
 
     function getSetting(key, defaultValue) {
@@ -241,6 +248,60 @@
         root.removeAttribute(ATTRIBUTES.detailLoaded);
     }
 
+    function applyTorrentResult(root, result) {
+        if (!root) return;
+        root.removeAttribute(ATTRIBUTES.torrentLoading);
+
+        if (!document.documentElement.contains(root)) return;
+        if (!result || result.rating == null) {
+            root.setAttribute(ATTRIBUTES.torrentLoaded, '1');
+            return;
+        }
+
+        var rate = root.querySelector('.explorer-card__head-rate');
+        var value = rate && rate.querySelector('span');
+        if (!rate || !value) return;
+
+        if (!rate.hasAttribute(ATTRIBUTES.torrentOriginalHidden)) {
+            rate.setAttribute(ATTRIBUTES.torrentOriginalHidden, rate.classList.contains('hide') ? '1' : '0');
+            rate.setAttribute(ATTRIBUTES.torrentOriginalText, value.innerText || '');
+            if (rate.hasAttribute('title')) {
+                rate.setAttribute(ATTRIBUTES.torrentOriginalHadTitle, '1');
+                rate.setAttribute(ATTRIBUTES.torrentOriginalTitle, rate.getAttribute('title') || '');
+            }
+        }
+
+        rate.classList.remove('hide');
+        value.innerText = formatRating(result.rating);
+        rate.title = formatTooltip(result);
+        root.setAttribute(ATTRIBUTES.torrentLoaded, '1');
+    }
+
+    function restoreTorrent(root) {
+        if (!root) return;
+
+        var rate = root.querySelector('.explorer-card__head-rate');
+        var value = rate && rate.querySelector('span');
+        if (rate && rate.hasAttribute(ATTRIBUTES.torrentOriginalHidden)) {
+            if (value) value.innerText = rate.getAttribute(ATTRIBUTES.torrentOriginalText) || '';
+            if (rate.getAttribute(ATTRIBUTES.torrentOriginalHadTitle) === '1') {
+                rate.setAttribute('title', rate.getAttribute(ATTRIBUTES.torrentOriginalTitle) || '');
+            } else {
+                rate.removeAttribute('title');
+            }
+            if (rate.getAttribute(ATTRIBUTES.torrentOriginalHidden) === '1') rate.classList.add('hide');
+            else rate.classList.remove('hide');
+
+            rate.removeAttribute(ATTRIBUTES.torrentOriginalHidden);
+            rate.removeAttribute(ATTRIBUTES.torrentOriginalText);
+            rate.removeAttribute(ATTRIBUTES.torrentOriginalTitle);
+            rate.removeAttribute(ATTRIBUTES.torrentOriginalHadTitle);
+        }
+
+        root.removeAttribute(ATTRIBUTES.torrentLoading);
+        root.removeAttribute(ATTRIBUTES.torrentLoaded);
+    }
+
     function formatRating(rating) {
         var value = Number(rating).toFixed(1);
         return shouldShowLabel() ? 'IMDb ' + value : value;
@@ -279,6 +340,10 @@
         if (root) root.removeAttribute(ATTRIBUTES.detailLoading);
     }
 
+    function releaseTorrent(root) {
+        if (root) root.removeAttribute(ATTRIBUTES.torrentLoading);
+    }
+
     function scheduleFlush() {
         clearTimeout(state.flushTimer);
         state.flushTimer = setTimeout(flushQueue, BATCH_DELAY_MS);
@@ -300,7 +365,7 @@
         card.setAttribute(ATTRIBUTES.loading, '1');
         var entry = state.queue.get(key);
         if (!entry) {
-            entry = { item: request.item, cards: [], details: [] };
+            entry = { item: request.item, cards: [], details: [], torrents: [] };
             state.queue.set(key, entry);
         }
         entry.cards.push(card);
@@ -322,11 +387,34 @@
         root.setAttribute(ATTRIBUTES.detailLoading, '1');
         var entry = state.queue.get(request.key);
         if (!entry) {
-            entry = { item: request.item, cards: [], details: [] };
+            entry = { item: request.item, cards: [], details: [], torrents: [] };
             state.queue.set(request.key, entry);
         }
         if (!entry.details) entry.details = [];
         entry.details.push(root);
+        scheduleFlush();
+    }
+
+    function enqueueTorrent(root, data) {
+        if (!isEnabled() || !getServiceUrl() || !root || !data) return;
+
+        var request = createRequest(data);
+        if (!request) return;
+
+        if (state.cache.has(request.key)) {
+            applyTorrentResult(root, state.cache.get(request.key));
+            return;
+        }
+        if (root.getAttribute(ATTRIBUTES.torrentLoading) === '1') return;
+
+        root.setAttribute(ATTRIBUTES.torrentLoading, '1');
+        var entry = state.queue.get(request.key);
+        if (!entry) {
+            entry = { item: request.item, cards: [], details: [], torrents: [] };
+            state.queue.set(request.key, entry);
+        }
+        if (!entry.torrents) entry.torrents = [];
+        entry.torrents.push(root);
         scheduleFlush();
     }
 
@@ -376,6 +464,9 @@
             (queued.details || []).forEach(function (root) {
                 applyDetailResult(root, result);
             });
+            (queued.torrents || []).forEach(function (root) {
+                applyTorrentResult(root, result);
+            });
         });
     }
 
@@ -383,6 +474,7 @@
         entries.forEach(function (entry) {
             entry[1].cards.forEach(releaseCard);
             (entry[1].details || []).forEach(releaseDetail);
+            (entry[1].torrents || []).forEach(releaseTorrent);
         });
     }
 
@@ -451,6 +543,36 @@
         for (var i = 0; i < details.length; i++) processDetail(details[i]);
     }
 
+    function processTorrent(root) {
+        if (!root || root.getAttribute(ATTRIBUTES.torrentLoaded) === '1') return;
+        enqueueTorrent(root, root.imdb_torrent_data);
+    }
+
+    function findTorrentRoot(object) {
+        if (!object || !object.activity || !object.activity.render) return null;
+
+        var rendered = object.activity.render();
+        var body = rendered && rendered[0] ? rendered[0] : rendered;
+        if (!body) return null;
+        if (body.classList && body.classList.contains('explorer')) return body;
+        return body.querySelector ? body.querySelector('.explorer') : null;
+    }
+
+    function processTorrentActivity(object) {
+        if (!object || object.component !== 'torrents' || !object.movie) return;
+
+        var root = findTorrentRoot(object);
+        if (root) {
+            root.imdb_torrent_data = object.movie;
+            processTorrent(root);
+        }
+    }
+
+    function scanActiveTorrent() {
+        if (!Lampa.Activity || !Lampa.Activity.active) return;
+        processTorrentActivity(Lampa.Activity.active());
+    }
+
     function clearCardState() {
         var cards = document.querySelectorAll(CARD_SELECTOR);
         for (var i = 0; i < cards.length; i++) {
@@ -465,6 +587,11 @@
         for (var i = 0; i < details.length; i++) restoreDetail(details[i]);
     }
 
+    function clearTorrentState() {
+        var torrents = document.querySelectorAll('.explorer');
+        for (var i = 0; i < torrents.length; i++) restoreTorrent(torrents[i]);
+    }
+
     function resetPlugin() {
         state.generation++;
         state.cache.clear();
@@ -473,9 +600,11 @@
         state.flushTimer = null;
         clearCardState();
         clearDetailState();
+        clearTorrentState();
         setTimeout(function () {
             scanCards(document);
             scanDetails();
+            scanActiveTorrent();
         }, START_RETRY_MS);
     }
 
@@ -552,6 +681,16 @@
         state.fullListenerRegistered = true;
     }
 
+    function registerActivityListener() {
+        if (state.activityListenerRegistered || !Lampa.Listener) return;
+
+        Lampa.Listener.follow('activity', function (event) {
+            if (!event || event.type !== 'start') return;
+            processTorrentActivity(event.object);
+        });
+        state.activityListenerRegistered = true;
+    }
+
     function startPlugin() {
         if (state.started) return;
 
@@ -560,6 +699,7 @@
             !Lampa.Storage ||
             !Lampa.SettingsApi ||
             !Lampa.Listener ||
+            !Lampa.Activity ||
             !document.body
         ) {
             return;
@@ -567,8 +707,10 @@
 
         registerSettings();
         registerFullListener();
+        registerActivityListener();
         observeCards();
         scanCards(document);
+        scanActiveTorrent();
 
         state.started = true;
 
