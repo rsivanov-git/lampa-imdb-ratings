@@ -280,16 +280,37 @@
 
     function startPlugin() {
         if (state.started) return;
-        state.started = true;
+
+        if (
+            !window.Lampa ||
+            !Lampa.Storage ||
+            !Lampa.SettingsApi ||
+            !document.body
+        ) {
+            return;
+        }
+
         registerSettings();
         observeCards();
         scanCards(document);
+
+        state.started = true;
+
+        console.log('[IMDb Ratings] plugin started');
     }
 
     function tryStartPlugin() {
         if (state.started) return;
-        if (window.Lampa && Lampa.Storage && document.body) startPlugin();
-        else setTimeout(tryStartPlugin, START_RETRY_MS);
+
+        try {
+            startPlugin();
+        } catch (error) {
+            console.log('[IMDb Ratings] startup error:', error);
+        }
+
+        if (!state.started) {
+            setTimeout(tryStartPlugin, START_RETRY_MS);
+        }
     }
 
     if (document.readyState === 'loading') {
