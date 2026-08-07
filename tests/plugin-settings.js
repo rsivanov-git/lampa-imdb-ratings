@@ -14,7 +14,11 @@ function Element(classNames) {
     this.innerText = '';
     this.classList = {
         add: function (name) { if (classes.indexOf(name) === -1) classes.push(name); },
-        contains: function (name) { return classes.indexOf(name) !== -1; }
+        contains: function (name) { return classes.indexOf(name) !== -1; },
+        remove: function (name) {
+            var index = classes.indexOf(name);
+            if (index !== -1) classes.splice(index, 1);
+        }
     };
 
     Object.defineProperty(this, 'title', {
@@ -75,6 +79,26 @@ function createCard(data, rating, title) {
     return { card: card, vote: vote };
 }
 
+function createDetail(rating) {
+    var body = new Element('full-body');
+    var root = new Element('full-start-new');
+    var line = new Element('full-start-new__rate-line');
+    var tmdb = new Element('full-start__rate rate--tmdb');
+    var imdb = new Element('full-start__rate rate--imdb hide');
+    var tmdbValue = new Element();
+    var imdbValue = new Element();
+
+    tmdbValue.innerText = rating;
+    tmdb.appendChild(tmdbValue);
+    imdb.appendChild(imdbValue);
+    imdb.appendChild(new Element());
+    line.appendChild(tmdb);
+    line.appendChild(imdb);
+    root.appendChild(line);
+    body.appendChild(root);
+    return { body: body, root: root, tmdb: tmdb, imdb: imdb, imdbValue: imdbValue };
+}
+
 function delay(milliseconds) {
     return new Promise(function (resolve) { setTimeout(resolve, milliseconds); });
 }
@@ -82,9 +106,11 @@ function delay(milliseconds) {
 (async function () {
     var registeredParams = [];
     var componentRegistrations = 0;
+    var componentIcon = '';
     var observerAttempts = 0;
     var fetchAttempts = 0;
     var requestBodies = [];
+    var fullListeners = [];
     var settings = {
         imdb_batch_url: 'https://ratings.example.com',
         imdb_batch_token: 'test-token',
@@ -93,15 +119,24 @@ function delay(milliseconds) {
     };
     var valid = createCard({ id: 278, media_type: 'movie' }, '8.0', 'TMDB rating');
     var invalid = createCard({ id: 'custom-card', media_type: 'movie' }, '7.0');
+    var detail = createDetail('8.0');
     var cards = [valid.card, invalid.card];
 
     global.window = {};
     global.document = {
         body: new Element('body'),
-        documentElement: { contains: function (element) { return cards.indexOf(element) !== -1; } },
+        documentElement: {
+            contains: function (element) {
+                return cards.indexOf(element) !== -1 || element === detail.root;
+            }
+        },
         readyState: 'complete',
         createElement: function () { return new Element(); },
-        querySelectorAll: function (selector) { return selector === '.card' ? cards : []; },
+        querySelectorAll: function (selector) {
+            if (selector === '.card') return cards;
+            if (selector === '.full-start-new') return [detail.root];
+            return [];
+        },
         addEventListener: function () {}
     };
     global.MutationObserver = function () {
@@ -117,12 +152,21 @@ function delay(milliseconds) {
             }
         },
         SettingsApi: {
-            addComponent: function () { componentRegistrations++; },
+            addComponent: function (component) {
+                componentRegistrations++;
+                componentIcon = component.icon;
+            },
             addParam: function (setting) {
                 if (setting.param.type === 'input') {
                     assert.strictEqual(typeof setting.param.values, 'string');
                 }
                 registeredParams.push(setting);
+            }
+        },
+        Listener: {
+            follow: function (name, listener) {
+                assert.strictEqual(name, 'full');
+                fullListeners.push(listener);
             }
         }
     };
@@ -148,7 +192,10 @@ function delay(milliseconds) {
     await delay(1200);
 
     assert.strictEqual(componentRegistrations, 1, 'Startup retry must not duplicate the component');
+    assert.ok(componentIcon.indexOf('<title>IMDb</title>') !== -1, 'Settings must use the IMDb icon');
+    assert.ok(componentIcon.indexOf('<rect') === -1, 'Settings must not use the placeholder icon');
     assert.strictEqual(registeredParams.length, 4, 'Startup retry must not duplicate settings');
+    assert.strictEqual(fullListeners.length, 1, 'Startup retry must not duplicate the full-screen listener');
     assert.strictEqual(observerAttempts, 2, 'Observer startup should be retried once');
     assert.strictEqual(fetchAttempts, 2, 'A transient network error should be retried');
     assert.strictEqual(requestBodies[0].items.length, 1, 'Invalid card IDs must not enter the batch');
@@ -158,6 +205,17 @@ function delay(milliseconds) {
     assert.strictEqual(invalid.vote.innerText, '7.0');
     assert.strictEqual(invalid.card.hasAttribute('data-imdb-rating-loading'), false);
 
+    fullListeners[0]({
+        type: 'complite',
+        body: { 0: detail.body },
+        data: { movie: { id: 278, media_type: 'movie' } }
+    });
+
+    assert.strictEqual(detail.tmdb.classList.contains('hide'), true, 'TMDB rating must be hidden in details');
+    assert.strictEqual(detail.imdb.classList.contains('hide'), false, 'IMDb rating must be visible in details');
+    assert.strictEqual(detail.imdbValue.innerText, '9.3');
+    assert.strictEqual(detail.imdb.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
+
     settings.imdb_batch_enabled = false;
     registeredParams.find(function (entry) {
         return entry.param.name === 'imdb_batch_enabled';
@@ -166,6 +224,9 @@ function delay(milliseconds) {
     assert.strictEqual(valid.vote.innerText, '8.0', 'Disabling must restore the original rating');
     assert.strictEqual(valid.vote.getAttribute('title'), 'TMDB rating', 'Disabling must restore the original tooltip');
     assert.strictEqual(valid.vote.hasAttribute('data-imdb-rating'), false);
+    assert.strictEqual(detail.tmdb.classList.contains('hide'), false, 'Disabling must restore TMDB in details');
+    assert.strictEqual(detail.imdb.classList.contains('hide'), true, 'Disabling must restore the hidden IMDb block');
+    assert.strictEqual(detail.imdbValue.innerText, '');
 
     console.log('Plugin compatibility tests passed.');
 })().catch(function (error) {
