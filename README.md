@@ -33,9 +33,10 @@ First startup downloads/imports the IMDb ratings dataset. Existing ratings remai
 
 ## Tests
 
-The integration test uses a local one-row IMDb fixture and does not call IMDb or TMDB:
+Run the Lampa plugin compatibility test and the service integration test. The integration test uses a local one-row IMDb fixture and does not call IMDb or TMDB:
 
 ```bash
+node tests/plugin-settings.js
 ./tests/integration.sh
 ```
 

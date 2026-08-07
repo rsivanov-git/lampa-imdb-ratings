@@ -15,19 +15,28 @@
     var ATTRIBUTES = {
         loading: 'data-imdb-rating-loading',
         loaded: 'data-imdb-rating-loaded',
-        rating: 'data-imdb-rating'
+        rating: 'data-imdb-rating',
+        createdVote: 'data-imdb-created-vote',
+        originalText: 'data-imdb-original-text',
+        originalTitle: 'data-imdb-original-title',
+        originalHadTitle: 'data-imdb-original-had-title'
     };
     var CARD_SELECTOR = '.card';
     var BATCH_DELAY_MS = 120;
     var MAX_BATCH_SIZE = 60;
     var START_RETRY_MS = 250;
+    var REQUEST_RETRY_MS = 500;
+    var MAX_REQUEST_ATTEMPTS = 3;
 
     var state = {
         cache: new Map(),
         queue: new Map(),
         flushTimer: null,
         generation: 0,
-        started: false
+        started: false,
+        componentRegistered: false,
+        registeredSettings: {},
+        observer: null
     };
 
     function getSetting(key, defaultValue) {
@@ -55,15 +64,25 @@
         return data.media_type === 'tv' || data.first_air_date || (data.name && !data.title) ? 'tv' : 'movie';
     }
 
-    function getItemKey(data) {
-        return getMediaType(data) + ':' + data.id;
+    function normalizeTmdbId(value) {
+        var id = Number(value);
+        return isFinite(id) && id > 0 && Math.floor(id) === id && id <= 9007199254740991 ? id : 0;
     }
 
-    function createRequestItem(data) {
+    function normalizeImdbId(value) {
+        value = String(value || '');
+        return /^tt\d+$/.test(value) ? value : null;
+    }
+
+    function createRequest(data) {
+        var type = getMediaType(data);
+        var tmdb = normalizeTmdbId(data.id);
+        var imdb = normalizeImdbId(data.imdb_id);
+        if (!tmdb && !imdb) return null;
+
         return {
-            type: getMediaType(data),
-            tmdb: Number(data.id),
-            imdb: data.imdb_id || null
+            key: tmdb ? type + ':' + tmdb : 'imdb:' + imdb,
+            item: { type: type, tmdb: tmdb, imdb: imdb }
         };
     }
 
@@ -76,8 +95,43 @@
 
         vote = document.createElement('div');
         vote.classList.add('card__vote');
+        vote.setAttribute(ATTRIBUTES.createdVote, '1');
         view.appendChild(vote);
         return vote;
+    }
+
+    function rememberVoteState(vote) {
+        if (vote.getAttribute(ATTRIBUTES.createdVote) === '1' || vote.hasAttribute(ATTRIBUTES.originalText)) return;
+
+        vote.setAttribute(ATTRIBUTES.originalText, vote.innerText || '');
+        if (vote.hasAttribute('title')) {
+            vote.setAttribute(ATTRIBUTES.originalHadTitle, '1');
+            vote.setAttribute(ATTRIBUTES.originalTitle, vote.getAttribute('title') || '');
+        }
+    }
+
+    function restoreVote(card) {
+        var vote = card.querySelector('.card__vote');
+        if (!vote || !vote.hasAttribute(ATTRIBUTES.rating)) return;
+
+        if (vote.getAttribute(ATTRIBUTES.createdVote) === '1') {
+            if (vote.parentNode) vote.parentNode.removeChild(vote);
+            return;
+        }
+
+        if (vote.hasAttribute(ATTRIBUTES.originalText)) {
+            vote.innerText = vote.getAttribute(ATTRIBUTES.originalText) || '';
+        }
+        if (vote.getAttribute(ATTRIBUTES.originalHadTitle) === '1') {
+            vote.setAttribute('title', vote.getAttribute(ATTRIBUTES.originalTitle) || '');
+        } else {
+            vote.removeAttribute('title');
+        }
+
+        vote.removeAttribute(ATTRIBUTES.rating);
+        vote.removeAttribute(ATTRIBUTES.originalText);
+        vote.removeAttribute(ATTRIBUTES.originalTitle);
+        vote.removeAttribute(ATTRIBUTES.originalHadTitle);
     }
 
     function formatRating(rating) {
@@ -103,6 +157,7 @@
         var vote = findOrCreateVote(card);
         if (!vote) return;
 
+        rememberVoteState(vote);
         vote.innerText = formatRating(result.rating);
         vote.title = formatTooltip(result);
         vote.setAttribute(ATTRIBUTES.rating, result.rating);
@@ -119,9 +174,12 @@
     }
 
     function enqueueCard(card, data) {
-        if (!isEnabled() || !getServiceUrl() || !data || !data.id) return;
+        if (!isEnabled() || !getServiceUrl() || !data) return;
 
-        var key = getItemKey(data);
+        var request = createRequest(data);
+        if (!request) return;
+
+        var key = request.key;
         if (state.cache.has(key)) {
             applyResult(card, state.cache.get(key));
             return;
@@ -131,7 +189,7 @@
         card.setAttribute(ATTRIBUTES.loading, '1');
         var entry = state.queue.get(key);
         if (!entry) {
-            entry = { item: createRequestItem(data), cards: [] };
+            entry = { item: request.item, cards: [] };
             state.queue.set(key, entry);
         }
         entry.cards.push(card);
@@ -162,7 +220,11 @@
             })
         });
 
-        if (!response.ok) throw new Error('Rating service returned HTTP ' + response.status + '.');
+        if (!response.ok) {
+            var error = new Error('Rating service returned HTTP ' + response.status + '.');
+            error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+            throw error;
+        }
         var payload = await response.json();
         return payload.items || {};
     }
@@ -186,21 +248,34 @@
         });
     }
 
-    async function flushQueue() {
-        state.flushTimer = null;
-        if (!state.queue.size) return;
-
-        var entries = takeNextBatch();
-        var generation = state.generation;
+    async function processBatch(entries, generation, attempt) {
         try {
             var results = await requestRatings(entries);
             if (generation === state.generation) applyBatch(entries, results);
         } catch (error) {
-            if (generation === state.generation) {
-                console.log('IMDb rating request failed:', error);
-                releaseBatch(entries);
+            if (generation !== state.generation) return;
+
+            var retryable = error.retryable !== false;
+            if (retryable && attempt + 1 < MAX_REQUEST_ATTEMPTS) {
+                var retryDelay = REQUEST_RETRY_MS * Math.pow(2, attempt);
+                console.log('IMDb rating request failed, retrying:', error);
+                setTimeout(function () {
+                    if (generation === state.generation) processBatch(entries, generation, attempt + 1);
+                }, retryDelay);
+                return;
             }
+
+            console.log('IMDb rating request failed:', error);
+            releaseBatch(entries);
         }
+    }
+
+    function flushQueue() {
+        state.flushTimer = null;
+        if (!state.queue.size) return;
+
+        var entries = takeNextBatch();
+        processBatch(entries, state.generation, 0);
 
         if (state.queue.size) scheduleFlush();
     }
@@ -229,6 +304,7 @@
     function clearCardState() {
         var cards = document.querySelectorAll(CARD_SELECTOR);
         for (var i = 0; i < cards.length; i++) {
+            restoreVote(cards[i]);
             cards[i].removeAttribute(ATTRIBUTES.loaded);
             cards[i].removeAttribute(ATTRIBUTES.loading);
         }
@@ -245,86 +321,45 @@
     }
 
     function addSetting(key, type, defaultValue, name, description) {
+        if (state.registeredSettings[key]) return;
+
+        var param = { name: key, type: type, default: defaultValue };
+
+        // Lampa 3.2.8 calls Params.select() for input fields and expects
+        // param.values to be a string. Without it, opening the settings page
+        // fails while evaluating values[name][key].
+        if (type === 'input') param.values = '';
+
         Lampa.SettingsApi.addParam({
             component: COMPONENT,
-            param: { name: key, type: type, default: defaultValue },
+            param: param,
             field: { name: name, description: description },
             onChange: resetPlugin
         });
+        state.registeredSettings[key] = true;
     }
-    
+
     function registerSettings() {
         if (!Lampa.SettingsApi) return;
-    
-        Lampa.SettingsApi.addComponent({
-            component: COMPONENT,
-            name: 'IMDb Ratings',
-            icon:
-                '<svg viewBox="0 0 24 24">' +
-                '<rect x="2" y="5" width="20" height="14" rx="2" fill="currentColor"/>' +
-                '</svg>'
-        });
-    
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: {
-                name: SETTINGS.url,
-                type: 'input',
-                values: '',
-                default: ''
-            },
-            field: {
-                name: 'Rating service URL',
-                description: 'For example: https://ratings.example.com'
-            },
-            onChange: resetPlugin
-        });
-    
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: {
-                name: SETTINGS.token,
-                type: 'input',
-                values: '',
-                default: ''
-            },
-            field: {
-                name: 'Service token',
-                description: 'Sent to the rating service as X-Api-Key'
-            },
-            onChange: resetPlugin
-        });
-    
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: {
-                name: SETTINGS.enabled,
-                type: 'trigger',
-                default: true
-            },
-            field: {
-                name: 'Use IMDb ratings',
-                description: 'Replace poster ratings with IMDb ratings'
-            },
-            onChange: resetPlugin
-        });
-    
-        Lampa.SettingsApi.addParam({
-            component: COMPONENT,
-            param: {
-                name: SETTINGS.label,
-                type: 'trigger',
-                default: false
-            },
-            field: {
-                name: 'Show IMDb label',
-                description: 'Display IMDb 8.4 instead of 8.4'
-            },
-            onChange: resetPlugin
-        });
+
+        if (!state.componentRegistered) {
+            Lampa.SettingsApi.addComponent({
+                component: COMPONENT,
+                name: 'IMDb Ratings',
+                icon: '<svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2" fill="currentColor"/></svg>'
+            });
+            state.componentRegistered = true;
+        }
+
+        addSetting(SETTINGS.url, 'input', '', 'Rating service URL', 'For example: https://ratings.example.com');
+        addSetting(SETTINGS.token, 'input', '', 'Service token', 'Sent to the rating service as X-Api-Key');
+        addSetting(SETTINGS.enabled, 'trigger', true, 'Use IMDb ratings', 'Replace poster ratings with IMDb ratings');
+        addSetting(SETTINGS.label, 'trigger', false, 'Show IMDb label', 'Display IMDb 8.4 instead of 8.4');
     }
 
     function observeCards() {
+        if (state.observer) return;
+
         var observer = new MutationObserver(function (mutations) {
             mutations.forEach(function (mutation) {
                 for (var i = 0; i < mutation.addedNodes.length; i++) {
@@ -333,6 +368,7 @@
             });
         });
         observer.observe(document.body, { childList: true, subtree: true });
+        state.observer = observer;
     }
 
     function startPlugin() {
