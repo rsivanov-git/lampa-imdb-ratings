@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore Server/LampaImdbRatings.csproj
+
+      - name: Test Lampa plugin
+        run: node tests/plugin-settings.js
+
+      - name: Test service
+        run: ./tests/integration.sh
+
+      - name: Validate Docker build
+        run: docker build --tag lampa-imdb-ratings:ci Server

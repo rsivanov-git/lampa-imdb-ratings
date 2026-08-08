@@ -1,6 +1,6 @@
 services:
   imdb-ratings:
-    build: ./Server
+    image: "ghcr.io/rsivanov-git/lampa-imdb-ratings:${IMAGE_TAG:-latest}"
     container_name: imdb-ratings
     restart: unless-stopped
     ports:
