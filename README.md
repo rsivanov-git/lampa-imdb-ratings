@@ -14,10 +14,19 @@ cp .env.example .env
 
 ## 2. Start
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 The service listens on `127.0.0.1:8088`, intended to be published via your existing HTTPS reverse proxy.
+
+By default Compose pulls `ghcr.io/rsivanov-git/lampa-imdb-ratings:latest`. To deploy a specific release instead, add its tag to `.env`, for example:
+
+```dotenv
+IMAGE_TAG=v1.2.3
+```
+
+Then run `docker compose pull && docker compose up -d` again. If the GitHub Container Registry package is private, authenticate on the deployment host first with a GitHub token that has `read:packages` permission.
 
 Readiness check (returns HTTP 503 until ratings have been imported):
 ```bash
@@ -41,6 +50,20 @@ node tests/plugin-settings.js
 ```
 
 It requires .NET 10 or newer, Python 3, `curl`, and `gzip`. Set `DOTNET_CMD` for a non-default .NET installation, or set `APP_IMAGE` to test an already-built Docker image.
+
+## Releases and container images
+
+GitHub Actions runs the test suite on pushes to `main` and on pull requests. Publishing a GitHub Release runs the tests again and, if they pass, publishes a multi-platform (`linux/amd64` and `linux/arm64`) image to GitHub Container Registry.
+
+The release tag is always published as an image tag. Semantic versions such as `v1.2.3` also publish `1.2.3`, `1.2`, and `1`; a non-prerelease additionally updates `latest`. Prereleases never replace `latest`.
+
+To publish a version:
+
+1. Create a tag such as `v1.2.3` for the commit to release.
+2. Create and publish a GitHub Release from that tag.
+3. Wait for the **Publish release image** workflow to finish.
+
+The workflow publishes with the repository's built-in `GITHUB_TOKEN`; no registry secret is required. For unauthenticated deployment, make the resulting package public in its GitHub package settings.
 
 ## Daily refresh
 Default: 16:00 UTC every day (`REFRESH_UTC_HOUR=16`). On startup the service also refreshes if the last successful check was more than 20 hours ago.
