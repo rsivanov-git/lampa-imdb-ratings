@@ -32,6 +32,11 @@ builder.Services.AddHttpClient("imdb", client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd("LampaImdbRatings/1.0");
 });
 
+builder.Services.AddHttpClient("imdb-live", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(12);
+});
+
 builder.Services.AddHttpClient("tmdb", (sp, client) =>
 {
     var cfg = sp.GetRequiredService<AppConfig>();
@@ -43,6 +48,7 @@ builder.Services.AddHttpClient("tmdb", (sp, client) =>
 
 builder.Services.AddSingleton<Db>();
 builder.Services.AddSingleton<TmdbResolver>();
+builder.Services.AddSingleton<ImdbLiveFallback>();
 builder.Services.AddSingleton<RatingsUpdater>();
 builder.Services.AddHostedService<RatingsRefreshWorker>();
 
@@ -66,14 +72,15 @@ app.MapGet("/health", async (Db db, AppConfig cfg) =>
         refreshedAt = meta.RefreshedAt,
         datasetLastModified = meta.LastModified,
         tmdbConfigured = !string.IsNullOrWhiteSpace(cfg.TmdbToken),
-        tmdbMissCacheHours = cfg.TmdbMissCacheHours
+        tmdbMissCacheHours = cfg.TmdbMissCacheHours,
+        imdbLiveFallback = true
     };
     return ready ? Results.Ok(body) : Results.Json(body, statusCode: StatusCodes.Status503ServiceUnavailable);
 });
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "ok" }));
 
-app.MapPost("/api/ratings", async (HttpRequest http, BatchRequest request, Db db, TmdbResolver tmdb, AppConfig cfg, ILoggerFactory loggerFactory, CancellationToken ct) =>
+app.MapPost("/api/ratings", async (HttpRequest http, BatchRequest request, Db db, TmdbResolver tmdb, ImdbLiveFallback live, AppConfig cfg, ILoggerFactory loggerFactory, CancellationToken ct) =>
 {
     if (!Authorize(http, cfg.ServiceToken))
         return Results.Unauthorized();
@@ -131,6 +138,7 @@ app.MapPost("/api/ratings", async (HttpRequest http, BatchRequest request, Db db
 
     var imdbIds = imdbByKey.Values.Where(IsImdbId).Cast<string>().Distinct().ToArray();
     var ratings = await db.GetRatingsAsync(imdbIds, ct);
+    await live.FillMissingAsync(ratings, imdbIds, ct);
 
     var response = new Dictionary<string, object?>();
     foreach (var item in items)
