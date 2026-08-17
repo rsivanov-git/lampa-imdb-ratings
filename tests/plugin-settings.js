@@ -191,9 +191,16 @@ function delay(milliseconds) {
         },
         Activity: {
             active: function () { return activeActivity; }
+        },
+        Card: function (data) {
+            this.data = data || {};
+            this.html = new Element('card');
         }
     };
+    global.Lampa.Card.prototype.create = function () { return this; };
+    global.Lampa.Card.prototype.render = function () { return this.html; };
     window.Lampa = global.Lampa;
+
     global.fetch = function (url, options) {
         fetchAttempts++;
         requestBodies.push(JSON.parse(options.body));
