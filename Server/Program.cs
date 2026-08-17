@@ -437,15 +437,13 @@ sealed class RatingsRefreshWorker(RatingsUpdater updater, AppConfig cfg, ILogger
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await updater.RefreshAsync(force: false, stoppingToken);
+        const int checkIntervalHours = 1;
+
+        await updater.RefreshAsync(force: true, stoppingToken);
         while (!stoppingToken.IsCancellationRequested)
         {
-            var now = DateTimeOffset.UtcNow;
-            var next = new DateTimeOffset(now.Year, now.Month, now.Day, cfg.RefreshUtcHour, 0, 0, TimeSpan.Zero);
-            if (next <= now) next = next.AddDays(1);
-            var delay = next - now;
-            log.LogInformation("Next IMDb refresh scheduled for {NextUtc}", next);
-            await Task.Delay(delay, stoppingToken);
+            log.LogInformation("Next IMDb dataset check in {Hours} hour(s).", checkIntervalHours);
+            await Task.Delay(TimeSpan.FromHours(checkIntervalHours), stoppingToken);
             await updater.RefreshAsync(force: true, stoppingToken);
         }
     }
