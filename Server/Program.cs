@@ -433,7 +433,7 @@ sealed class RatingsUpdater(IHttpClientFactory factory, Db db, AppConfig cfg, IL
     }
 }
 
-sealed class RatingsRefreshWorker(RatingsUpdater updater, AppConfig cfg, ILogger<RatingsRefreshWorker> log) : BackgroundService
+sealed class RatingsRefreshWorker(RatingsUpdater updater, ILogger<RatingsRefreshWorker> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
