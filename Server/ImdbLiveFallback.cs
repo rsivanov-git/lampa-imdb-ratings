@@ -1,9 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
-using System.Net;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
 sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger<ImdbLiveFallback> log)
@@ -60,11 +58,15 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
                     RatingRow? rating = null;
                     try
                     {
-                        rating = await FetchLiveRatingAsync(imdbId, itemCt);
+                        rating = await FetchGraphQlRatingAsync(imdbId, itemCt);
+                        if (rating is not null)
+                            log.LogInformation("IMDb GraphQL fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
+                        else
+                            log.LogInformation("IMDb GraphQL fallback returned no rating for {ImdbId}", imdbId);
                     }
                     catch (Exception ex) when (!itemCt.IsCancellationRequested)
                     {
-                        log.LogWarning(ex, "IMDb live fallback failed for {ImdbId}", imdbId);
+                        log.LogWarning(ex, "IMDb GraphQL fallback failed for {ImdbId}", imdbId);
                     }
 
                     await PutCachedAsync(imdbId, rating, itemCt);
@@ -74,27 +76,6 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
 
         foreach (var pair in resolved)
             ratings[pair.Key] = pair.Value;
-    }
-
-    private async Task<RatingRow?> FetchLiveRatingAsync(string imdbId, CancellationToken ct)
-    {
-        try
-        {
-            var graphQl = await FetchGraphQlRatingAsync(imdbId, ct);
-            if (graphQl is not null)
-            {
-                log.LogInformation("IMDb GraphQL fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, graphQl.Rating, graphQl.Votes);
-                return graphQl;
-            }
-
-            log.LogInformation("IMDb GraphQL fallback returned no rating for {ImdbId}", imdbId);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            log.LogWarning(ex, "IMDb GraphQL fallback failed for {ImdbId}; trying HTML fallback", imdbId);
-        }
-
-        return await FetchHtmlRatingAsync(imdbId, ct);
     }
 
     private async Task<RatingRow?> FetchGraphQlRatingAsync(string imdbId, CancellationToken ct)
@@ -132,84 +113,6 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         return rating is > 0 and <= 10 && votes is > 0
             ? new RatingRow(rating.Value, votes.Value)
             : null;
-    }
-
-    private async Task<RatingRow?> FetchHtmlRatingAsync(string imdbId, CancellationToken ct)
-    {
-        var client = factory.CreateClient("imdb-live");
-        client.Timeout = TimeSpan.FromSeconds(12);
-
-        using var req = new HttpRequestMessage(HttpMethod.Get, $"https://www.imdb.com/title/{imdbId}/");
-        req.Headers.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36");
-        req.Headers.Accept.ParseAdd("text/html,application/xhtml+xml");
-        req.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
-
-        using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
-        if (resp.StatusCode == HttpStatusCode.NotFound) return null;
-        resp.EnsureSuccessStatusCode();
-
-        var html = await resp.Content.ReadAsStringAsync(ct);
-        var rating = ParseStructuredRating(html);
-        if (rating is not null)
-            log.LogInformation("IMDb HTML fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
-        else
-            log.LogInformation("IMDb live fallback found no rating for {ImdbId}", imdbId);
-        return rating;
-    }
-
-    internal static RatingRow? ParseStructuredRating(string html)
-    {
-        foreach (Match match in Regex.Matches(
-                     html,
-                     "<script[^>]+type=[\\\"']application/ld\\+json[\\\"'][^>]*>(.*?)</script>",
-                     RegexOptions.IgnoreCase | RegexOptions.Singleline))
-        {
-            var jsonText = WebUtility.HtmlDecode(match.Groups[1].Value.Trim());
-            if (string.IsNullOrWhiteSpace(jsonText)) continue;
-
-            try
-            {
-                using var doc = JsonDocument.Parse(jsonText);
-                var found = FindAggregateRating(doc.RootElement);
-                if (found is not null) return found;
-            }
-            catch (JsonException)
-            {
-                // Ignore malformed structured-data blocks and continue with the next one.
-            }
-        }
-
-        return null;
-    }
-
-    private static RatingRow? FindAggregateRating(JsonElement element)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            if (element.TryGetProperty("aggregateRating", out var aggregate) && aggregate.ValueKind == JsonValueKind.Object)
-            {
-                var rating = ReadDouble(aggregate, "ratingValue");
-                var votes = ReadLong(aggregate, "ratingCount");
-                if (rating is > 0 and <= 10 && votes is > 0)
-                    return new RatingRow(rating.Value, votes.Value);
-            }
-
-            foreach (var property in element.EnumerateObject())
-            {
-                var found = FindAggregateRating(property.Value);
-                if (found is not null) return found;
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                var found = FindAggregateRating(item);
-                if (found is not null) return found;
-            }
-        }
-
-        return null;
     }
 
     private static double? ReadDouble(JsonElement element, string property)
