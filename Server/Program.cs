@@ -23,7 +23,7 @@ builder.Services.AddSingleton(new AppConfig(
     ImdbRatingsUrl: Environment.GetEnvironmentVariable("IMDB_RATINGS_URL") ?? "https://datasets.imdbws.com/title.ratings.tsv.gz",
     RefreshUtcHour: int.TryParse(Environment.GetEnvironmentVariable("REFRESH_UTC_HOUR"), out var hour) ? Math.Clamp(hour, 0, 23) : 16,
     MinimumRatingRows: int.TryParse(Environment.GetEnvironmentVariable("MINIMUM_RATING_ROWS"), out var minRows) ? Math.Max(minRows, 1) : 100_000,
-    TmdbMissCacheHours: int.TryParse(Environment.GetEnvironmentVariable("TMDB_MISS_CACHE_HOURS"), out var missHours) ? Math.Max(missHours, 1) : 24
+    TmdbMissCacheHours: int.TryParse(Environment.GetEnvironmentVariable("TMDB_MISS_CACHE_HOURS"), out var missHours) ? Math.Max(missHours, 1) : 1
 ));
 
 builder.Services.AddHttpClient("imdb", client =>
@@ -65,7 +65,8 @@ app.MapGet("/health", async (Db db, AppConfig cfg) =>
         ratings = meta.RatingCount,
         refreshedAt = meta.RefreshedAt,
         datasetLastModified = meta.LastModified,
-        tmdbConfigured = !string.IsNullOrWhiteSpace(cfg.TmdbToken)
+        tmdbConfigured = !string.IsNullOrWhiteSpace(cfg.TmdbToken),
+        tmdbMissCacheHours = cfg.TmdbMissCacheHours
     };
     return ready ? Results.Ok(body) : Results.Json(body, statusCode: StatusCodes.Status503ServiceUnavailable);
 });
@@ -231,6 +232,15 @@ sealed class Db(AppConfig cfg)
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    public async Task<int> DeleteExpiredNegativeMappingsAsync(CancellationToken ct)
+    {
+        await using var cn = new SqliteConnection(Cs); await cn.OpenAsync(ct);
+        await using var cmd = cn.CreateCommand();
+        cmd.CommandText = "DELETE FROM tmdb_map WHERE imdb_id='' AND updated_at < $cutoff";
+        cmd.Parameters.AddWithValue("$cutoff", DateTimeOffset.UtcNow.AddHours(-cfg.TmdbMissCacheHours).ToString("O"));
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task<Dictionary<string, RatingRow>> GetRatingsAsync(IEnumerable<string> ids, CancellationToken ct)
     {
         var arr = ids.Distinct().ToArray();
@@ -387,6 +397,10 @@ sealed class RatingsUpdater(IHttpClientFactory factory, Db db, AppConfig cfg, IL
         if (!await _gate.WaitAsync(0, ct)) return;
         try
         {
+            var deletedMisses = await db.DeleteExpiredNegativeMappingsAsync(ct);
+            if (deletedMisses > 0)
+                log.LogInformation("Deleted {Count} expired TMDB negative mappings.", deletedMisses);
+
             var state = await db.GetRefreshStateAsync(ct);
             if (!force && state.RefreshedAt is not null && DateTimeOffset.UtcNow - state.RefreshedAt < TimeSpan.FromHours(20)) return;
 
