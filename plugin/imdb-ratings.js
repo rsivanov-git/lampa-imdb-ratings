@@ -53,7 +53,8 @@
         registeredSettings: {},
         observer: null,
         fullListenerRegistered: false,
-        activityListenerRegistered: false
+        activityListenerRegistered: false,
+        searchListenerRegistered: false
     };
 
     function getSetting(key, defaultValue) {
@@ -625,9 +626,6 @@
 
         var param = { name: key, type: type, default: defaultValue };
 
-        // Lampa 3.2.8 calls Params.select() for input fields and expects
-        // param.values to be a string. Without it, opening the settings page
-        // fails while evaluating values[name][key].
         if (type === 'input') param.values = '';
 
         Lampa.SettingsApi.addParam({
@@ -694,11 +692,14 @@
 
     function getDetailMovie(event) {
         if (event && event.data && event.data.movie) return event.data.movie;
+        if (event && event.data && event.data.card) return event.data.card;
         if (event && event.movie) return event.movie;
+        if (event && event.card) return event.card;
 
         if (Lampa.Activity && Lampa.Activity.active) {
             var active = Lampa.Activity.active();
             if (active && active.movie) return active.movie;
+            if (active && active.card) return active.card;
         }
 
         return null;
@@ -731,6 +732,27 @@
         state.fullListenerRegistered = true;
     }
 
+    function registerSearchListener() {
+        if (state.searchListenerRegistered || !Lampa.Search || !Lampa.Search.listener) return;
+
+        Lampa.Search.listener.follow('sources', function (event) {
+            var sources = event && event.sources;
+            if (!sources || !sources.listener) return;
+
+            sources.listener.follow('finded', function (found) {
+                if (!found || !found.result || !found.result.render) return;
+
+                var root = found.result.render(true);
+                if (!root) return;
+
+                scanCards(root);
+                setTimeout(function () { scanCards(root); }, 50);
+            });
+        });
+
+        state.searchListenerRegistered = true;
+    }
+
     function registerActivityListener() {
         if (state.activityListenerRegistered || !Lampa.Listener) return;
 
@@ -750,6 +772,7 @@
             !Lampa.SettingsApi ||
             !Lampa.Listener ||
             !Lampa.Activity ||
+            !Lampa.Search ||
             !document.body
         ) {
             return;
@@ -757,6 +780,7 @@
 
         registerSettings();
         registerFullListener();
+        registerSearchListener();
         registerActivityListener();
         observeCards();
         scanCards(document);
