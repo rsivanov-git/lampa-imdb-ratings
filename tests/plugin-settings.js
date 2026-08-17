@@ -131,29 +131,33 @@ function delay(milliseconds) {
     var settings = {
         imdb_batch_url: 'https://ratings.example.com',
         imdb_batch_token: 'test-token',
-        imdb_batch_enabled: true,
         imdb_batch_label: false
     };
     var valid = createCard({ id: 278, media_type: 'movie' }, '8.0', 'TMDB rating');
+    var missing = createCard({ id: 95350, media_type: 'tv' }, '8.2', 'TMDB rating');
     var invalid = createCard({ id: 'custom-card', media_type: 'movie' }, '7.0');
     var detail = createDetail('8.0');
+    var missingDetail = createDetail('8.2');
     var torrentDetail = createTorrentDetail('8.0');
-    var cards = [valid.card, invalid.card];
+    var missingTorrentDetail = createTorrentDetail('8.2');
+    var cards = [valid.card, missing.card, invalid.card];
+    var detailRoots = [detail.root, missingDetail.root];
+    var torrentRoots = [torrentDetail.root, missingTorrentDetail.root];
 
     global.window = {};
     global.document = {
         body: new Element('body'),
         documentElement: {
             contains: function (element) {
-                return cards.indexOf(element) !== -1 || element === detail.root || element === torrentDetail.root;
+                return cards.indexOf(element) !== -1 || detailRoots.indexOf(element) !== -1 || torrentRoots.indexOf(element) !== -1;
             }
         },
         readyState: 'complete',
         createElement: function (tagName) { return new Element('', tagName); },
         querySelectorAll: function (selector) {
             if (selector === '.card') return cards;
-            if (selector === '.full-start-new') return [detail.root];
-            if (selector === '.explorer') return [torrentDetail.root];
+            if (selector === '.full-start-new') return detailRoots;
+            if (selector === '.explorer') return torrentRoots;
             return [];
         },
         addEventListener: function () {}
@@ -212,7 +216,10 @@ function delay(milliseconds) {
             ok: true,
             json: function () {
                 return Promise.resolve({
-                    items: { 'movie:278': { rating: 9.3, votes: 3100000 } }
+                    items: {
+                        'movie:278': { rating: 9.3, votes: 3100000 },
+                        'tv:95350': { imdb: 'tt26545992', rating: null, votes: null }
+                    }
                 });
             }
         });
@@ -224,15 +231,23 @@ function delay(milliseconds) {
     assert.strictEqual(componentRegistrations, 1, 'Startup retry must not duplicate the component');
     assert.ok(componentIcon.indexOf('<title>IMDb</title>') !== -1, 'Settings must use the IMDb icon');
     assert.ok(componentIcon.indexOf('<rect') === -1, 'Settings must not use the placeholder icon');
-    assert.strictEqual(registeredParams.length, 4, 'Startup retry must not duplicate settings');
+    assert.strictEqual(registeredParams.length, 3, 'Plugin must expose URL, token, and label settings only');
+    assert.strictEqual(registeredParams.some(function (entry) { return entry.param.name === 'imdb_batch_enabled'; }), false, 'Use IMDb ratings toggle must be removed');
     assert.strictEqual(fullListeners.length, 1, 'Startup retry must not duplicate the full-screen listener');
     assert.strictEqual(activityListeners.length, 1, 'Startup retry must not duplicate the activity listener');
     assert.strictEqual(observerAttempts, 2, 'Observer startup should be retried once');
     assert.strictEqual(fetchAttempts, 2, 'A transient network error should be retried');
-    assert.strictEqual(requestBodies[0].items.length, 1, 'Invalid card IDs must not enter the batch');
-    assert.deepStrictEqual(requestBodies[0].items[0], { type: 'movie', tmdb: 278, imdb: null });
+    assert.strictEqual(requestBodies[0].items.length, 2, 'Invalid card IDs must not enter the batch');
+    assert.ok(requestBodies[0].items.some(function (item) { return item.type === 'movie' && item.tmdb === 278; }));
+    assert.ok(requestBodies[0].items.some(function (item) { return item.type === 'tv' && item.tmdb === 95350; }));
+
     assert.strictEqual(valid.vote.innerText, '9.3');
+    assert.strictEqual(valid.vote.classList.contains('hide'), false);
     assert.strictEqual(valid.vote.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
+
+    assert.strictEqual(missing.vote.classList.contains('hide'), true, 'TMDB card rating must be hidden when IMDb is unavailable');
+    assert.strictEqual(missing.vote.getAttribute('title'), null);
+
     assert.strictEqual(invalid.vote.innerText, '7.0');
     assert.strictEqual(invalid.card.hasAttribute('data-imdb-rating-loading'), false);
 
@@ -247,6 +262,15 @@ function delay(milliseconds) {
     assert.strictEqual(detail.imdbValue.innerText, '9.3');
     assert.strictEqual(detail.imdb.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
 
+    fullListeners[0]({
+        type: 'complite',
+        body: { 0: missingDetail.body },
+        data: { movie: { id: 95350, media_type: 'tv' } }
+    });
+
+    assert.strictEqual(missingDetail.tmdb.classList.contains('hide'), true, 'TMDB detail rating must stay hidden when IMDb is unavailable');
+    assert.strictEqual(missingDetail.imdb.classList.contains('hide'), true, 'Empty IMDb detail block must stay hidden');
+
     activeActivity = {
         component: 'torrents',
         movie: { id: 278, media_type: 'movie' },
@@ -255,21 +279,18 @@ function delay(milliseconds) {
     activityListeners[0]({ type: 'start', object: activeActivity });
 
     assert.strictEqual(torrentDetail.value.innerText, '9.3', 'Torrent details must show the IMDb rating');
+    assert.strictEqual(torrentDetail.rate.classList.contains('hide'), false);
     assert.strictEqual(torrentDetail.rate.getAttribute('title'), 'IMDb: 9.3 · 3100000 votes');
 
-    settings.imdb_batch_enabled = false;
-    registeredParams.find(function (entry) {
-        return entry.param.name === 'imdb_batch_enabled';
-    }).onChange();
+    activeActivity = {
+        component: 'torrents',
+        movie: { id: 95350, media_type: 'tv' },
+        activity: { render: function () { return { 0: missingTorrentDetail.body }; } }
+    };
+    activityListeners[0]({ type: 'start', object: activeActivity });
 
-    assert.strictEqual(valid.vote.innerText, '8.0', 'Disabling must restore the original rating');
-    assert.strictEqual(valid.vote.getAttribute('title'), 'TMDB rating', 'Disabling must restore the original tooltip');
-    assert.strictEqual(valid.vote.hasAttribute('data-imdb-rating'), false);
-    assert.strictEqual(detail.tmdb.classList.contains('hide'), false, 'Disabling must restore TMDB in details');
-    assert.strictEqual(detail.imdb.classList.contains('hide'), true, 'Disabling must restore the hidden IMDb block');
-    assert.strictEqual(detail.imdbValue.innerText, '');
-    assert.strictEqual(torrentDetail.value.innerText, '8.0', 'Disabling must restore TMDB in torrent details');
-    assert.strictEqual(torrentDetail.rate.hasAttribute('title'), false);
+    assert.strictEqual(missingTorrentDetail.rate.classList.contains('hide'), true, 'Torrent TMDB rating must be hidden when IMDb is unavailable');
+    assert.strictEqual(missingTorrentDetail.rate.getAttribute('title'), null);
 
     console.log('Plugin compatibility tests passed.');
 })().catch(function (error) {
