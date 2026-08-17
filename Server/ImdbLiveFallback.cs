@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
@@ -10,6 +11,7 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
     private const int CacheHours = 1;
     private const int MaxNetworkLookupsPerBatch = 12;
     private const int MaxParallelism = 3;
+    private const string CacheTable = "live_ratings_v2";
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private bool _initialized;
 
@@ -76,6 +78,64 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
 
     private async Task<RatingRow?> FetchLiveRatingAsync(string imdbId, CancellationToken ct)
     {
+        try
+        {
+            var graphQl = await FetchGraphQlRatingAsync(imdbId, ct);
+            if (graphQl is not null)
+            {
+                log.LogInformation("IMDb GraphQL fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, graphQl.Rating, graphQl.Votes);
+                return graphQl;
+            }
+
+            log.LogInformation("IMDb GraphQL fallback returned no rating for {ImdbId}", imdbId);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            log.LogWarning(ex, "IMDb GraphQL fallback failed for {ImdbId}; trying HTML fallback", imdbId);
+        }
+
+        return await FetchHtmlRatingAsync(imdbId, ct);
+    }
+
+    private async Task<RatingRow?> FetchGraphQlRatingAsync(string imdbId, CancellationToken ct)
+    {
+        var client = factory.CreateClient("imdb-live");
+        client.Timeout = TimeSpan.FromSeconds(12);
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, "https://api.graphql.imdb.com/");
+        req.Headers.UserAgent.ParseAdd("Mozilla/5.0");
+        req.Headers.TryAddWithoutValidation("Origin", "https://www.imdb.com");
+        req.Headers.Referrer = new Uri("https://www.imdb.com/");
+
+        var query = $"query {{ title(id: \"{imdbId}\") {{ ratingsSummary {{ aggregateRating voteCount }} }} }}";
+        req.Content = new StringContent(JsonSerializer.Serialize(new { query }), Encoding.UTF8, "application/json");
+
+        using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
+        resp.EnsureSuccessStatusCode();
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+
+        if (doc.RootElement.TryGetProperty("errors", out var errors) && errors.ValueKind == JsonValueKind.Array && errors.GetArrayLength() > 0)
+            throw new InvalidDataException("IMDb GraphQL returned errors: " + errors.GetRawText());
+
+        if (!doc.RootElement.TryGetProperty("data", out var data) ||
+            data.ValueKind != JsonValueKind.Object ||
+            !data.TryGetProperty("title", out var title) ||
+            title.ValueKind != JsonValueKind.Object ||
+            !title.TryGetProperty("ratingsSummary", out var summary) ||
+            summary.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var rating = ReadDouble(summary, "aggregateRating");
+        var votes = ReadLong(summary, "voteCount");
+        return rating is > 0 and <= 10 && votes is > 0
+            ? new RatingRow(rating.Value, votes.Value)
+            : null;
+    }
+
+    private async Task<RatingRow?> FetchHtmlRatingAsync(string imdbId, CancellationToken ct)
+    {
         var client = factory.CreateClient("imdb-live");
         client.Timeout = TimeSpan.FromSeconds(12);
 
@@ -91,9 +151,9 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         var html = await resp.Content.ReadAsStringAsync(ct);
         var rating = ParseStructuredRating(html);
         if (rating is not null)
-            log.LogInformation("IMDb live fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
+            log.LogInformation("IMDb HTML fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
         else
-            log.LogInformation("IMDb live fallback found no structured rating for {ImdbId}", imdbId);
+            log.LogInformation("IMDb live fallback found no rating for {ImdbId}", imdbId);
         return rating;
     }
 
@@ -178,8 +238,8 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
             await using var cn = new SqliteConnection(Cs);
             await cn.OpenAsync(ct);
             await using var cmd = cn.CreateCommand();
-            cmd.CommandText = """
-                CREATE TABLE IF NOT EXISTS live_ratings(
+            cmd.CommandText = $"""
+                CREATE TABLE IF NOT EXISTS {CacheTable}(
                   imdb_id TEXT PRIMARY KEY,
                   rating REAL NULL,
                   votes INTEGER NULL,
@@ -200,7 +260,7 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         await using var cn = new SqliteConnection(Cs);
         await cn.OpenAsync(ct);
         await using var cmd = cn.CreateCommand();
-        cmd.CommandText = "SELECT rating,votes,expires_at FROM live_ratings WHERE imdb_id=$id";
+        cmd.CommandText = $"SELECT rating,votes,expires_at FROM {CacheTable} WHERE imdb_id=$id";
         cmd.Parameters.AddWithValue("$id", imdbId);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
         if (!await rd.ReadAsync(ct)) return new CachedLiveRating(false, null);
@@ -217,8 +277,8 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         await using var cn = new SqliteConnection(Cs);
         await cn.OpenAsync(ct);
         await using var cmd = cn.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO live_ratings(imdb_id,rating,votes,expires_at)
+        cmd.CommandText = $"""
+            INSERT INTO {CacheTable}(imdb_id,rating,votes,expires_at)
             VALUES($id,$rating,$votes,$expires)
             ON CONFLICT(imdb_id) DO UPDATE SET
               rating=excluded.rating,
