@@ -21,7 +21,6 @@ builder.Services.AddSingleton(new AppConfig(
     TmdbToken: Environment.GetEnvironmentVariable("TMDB_TOKEN") ?? "",
     ServiceToken: serviceToken,
     ImdbRatingsUrl: Environment.GetEnvironmentVariable("IMDB_RATINGS_URL") ?? "https://datasets.imdbws.com/title.ratings.tsv.gz",
-    RefreshUtcHour: int.TryParse(Environment.GetEnvironmentVariable("REFRESH_UTC_HOUR"), out var hour) ? Math.Clamp(hour, 0, 23) : 16,
     MinimumRatingRows: int.TryParse(Environment.GetEnvironmentVariable("MINIMUM_RATING_ROWS"), out var minRows) ? Math.Max(minRows, 1) : 100_000,
     TmdbMissCacheHours: int.TryParse(Environment.GetEnvironmentVariable("TMDB_MISS_CACHE_HOURS"), out var missHours) ? Math.Max(missHours, 1) : 1
 ));
@@ -169,7 +168,7 @@ static bool Authorize(HttpRequest request, string expected)
 
 static bool IsImdbId(string? value) => value is not null && value.StartsWith("tt", StringComparison.Ordinal) && value.Length > 2 && value[2..].All(char.IsDigit);
 
-record AppConfig(string DbPath, string TmdbToken, string ServiceToken, string ImdbRatingsUrl, int RefreshUtcHour, int MinimumRatingRows, int TmdbMissCacheHours);
+record AppConfig(string DbPath, string TmdbToken, string ServiceToken, string ImdbRatingsUrl, int MinimumRatingRows, int TmdbMissCacheHours);
 record BatchRequest(List<BatchItem>? Items);
 record BatchItem(string Type, long Tmdb, string? Imdb)
 {
