@@ -65,8 +65,8 @@ To publish a version:
 
 The workflow publishes with the repository's built-in `GITHUB_TOKEN`; no registry secret is required. For unauthenticated deployment, make the resulting package public in its GitHub package settings.
 
-## Daily refresh
-Default: 16:00 UTC every day (`REFRESH_UTC_HOUR=16`). On startup the service also refreshes if the last successful check was more than 20 hours ago.
+## IMDb dataset refresh
+The service checks the IMDb ratings dataset once per hour. The schedule is fixed in the worker; there is no `REFRESH_UTC_HOUR` setting anymore.
 
 The GET uses `If-None-Match` / `If-Modified-Since` when available. A `304 Not Modified` only updates the last-check timestamp. A changed dataset is streamed through gzip into `ratings_next`; after a successful import a short SQLite transaction swaps it into place. Old ratings remain active until the swap succeeds. The swap is rejected if the header is invalid, fewer than `MINIMUM_RATING_ROWS` rows are imported, or an update unexpectedly loses more than 10% of the active rows.
 
@@ -102,10 +102,10 @@ Response:
 Host `plugin/imdb-ratings.js` at an HTTPS URL and add that URL under Lampa Extensions. Then set:
 - Rating service URL: your HTTPS service URL, no trailing `/api/ratings`
 - Service token: same `SERVICE_TOKEN`
-- IMDb instead of TMDB: enabled
 
 ## Notes
-- Successful `TMDB -> IMDb` mappings are permanent in SQLite. Missing mappings are cached for `TMDB_MISS_CACHE_HOURS` (24 hours by default); transient TMDB failures are not cached.
+- Successful `TMDB -> IMDb` mappings are permanent in SQLite. Missing mappings are cached for `TMDB_MISS_CACHE_HOURS` (1 hour by default); transient TMDB failures are not cached.
+- Ratings missing from the local dataset are requested from IMDb GraphQL in batches; successful live ratings are cached for 12 hours and confirmed missing ratings for 1 hour.
 - A visible row/screen becomes one Lampa HTTP batch after a 120 ms debounce. Max batch size is 60.
 - If a card already contains `imdb_id`, the server accepts it and skips TMDB resolution.
 - The IMDb non-commercial dataset is for personal/non-commercial use; verify IMDb terms for your deployment.
