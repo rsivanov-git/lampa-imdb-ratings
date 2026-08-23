@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -6,9 +5,10 @@ using Microsoft.Data.Sqlite;
 
 sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger<ImdbLiveFallback> log)
 {
-    private const int CacheHours = 1;
-    private const int MaxNetworkLookupsPerBatch = 12;
-    private const int MaxParallelism = 3;
+    private const int PositiveCacheHours = 12;
+    private const int NegativeCacheHours = 1;
+    private const int MaxTitlesPerGraphQlRequest = 20;
+    private const int MaxNetworkTitlesPerBatch = 100;
     private const string CacheTable = "live_ratings_v2";
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private bool _initialized;
@@ -31,7 +31,6 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
             .ToArray();
         if (missing.Length == 0) return;
 
-        var resolved = new ConcurrentDictionary<string, RatingRow>(StringComparer.Ordinal);
         var uncached = new List<string>();
 
         foreach (var imdbId in missing)
@@ -39,7 +38,8 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
             var cached = await GetCachedAsync(imdbId, ct);
             if (cached.IsCached)
             {
-                if (cached.Rating is not null) resolved[imdbId] = cached.Rating;
+                if (cached.Rating is not null)
+                    ratings[imdbId] = cached.Rating;
             }
             else
             {
@@ -47,39 +47,54 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
             }
         }
 
-        var lookupIds = uncached.Take(MaxNetworkLookupsPerBatch).ToArray();
-        if (lookupIds.Length > 0)
+        var lookupIds = uncached.Take(MaxNetworkTitlesPerBatch).ToArray();
+        foreach (var chunk in lookupIds.Chunk(MaxTitlesPerGraphQlRequest))
         {
-            await Parallel.ForEachAsync(
-                lookupIds,
-                new ParallelOptions { MaxDegreeOfParallelism = MaxParallelism, CancellationToken = ct },
-                async (imdbId, itemCt) =>
+            Dictionary<string, RatingRow?> batch;
+            try
+            {
+                batch = await FetchGraphQlRatingsAsync(chunk, ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // Transport, HTTP and malformed GraphQL responses are transient failures.
+                // Do not negative-cache them: the next request should be allowed to retry.
+                log.LogWarning(ex, "IMDb GraphQL batch fallback failed for {Count} title(s)", chunk.Length);
+                continue;
+            }
+
+            var found = 0;
+            foreach (var imdbId in chunk)
+            {
+                if (!batch.TryGetValue(imdbId, out var rating))
                 {
-                    RatingRow? rating = null;
-                    try
-                    {
-                        rating = await FetchGraphQlRatingAsync(imdbId, itemCt);
-                        if (rating is not null)
-                            log.LogInformation("IMDb GraphQL fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
-                        else
-                            log.LogInformation("IMDb GraphQL fallback returned no rating for {ImdbId}", imdbId);
-                    }
-                    catch (Exception ex) when (!itemCt.IsCancellationRequested)
-                    {
-                        log.LogWarning(ex, "IMDb GraphQL fallback failed for {ImdbId}", imdbId);
-                    }
+                    // A successful response must contain every requested alias. Treat an
+                    // incomplete response as transient for this title and don't cache it.
+                    log.LogWarning("IMDb GraphQL batch response omitted {ImdbId}; not caching", imdbId);
+                    continue;
+                }
 
-                    await PutCachedAsync(imdbId, rating, itemCt);
-                    if (rating is not null) resolved[imdbId] = rating;
-                });
+                await PutCachedAsync(imdbId, rating, ct);
+                if (rating is not null)
+                {
+                    ratings[imdbId] = rating;
+                    found++;
+                    log.LogInformation("IMDb GraphQL fallback resolved {ImdbId}: {Rating} ({Votes} votes)", imdbId, rating.Rating, rating.Votes);
+                }
+                else
+                {
+                    log.LogInformation("IMDb GraphQL fallback returned no rating for {ImdbId}", imdbId);
+                }
+            }
+
+            log.LogInformation("IMDb GraphQL batch completed: {Requested} requested, {Found} rating(s) found", chunk.Length, found);
         }
-
-        foreach (var pair in resolved)
-            ratings[pair.Key] = pair.Value;
     }
 
-    private async Task<RatingRow?> FetchGraphQlRatingAsync(string imdbId, CancellationToken ct)
+    private async Task<Dictionary<string, RatingRow?>> FetchGraphQlRatingsAsync(IReadOnlyList<string> imdbIds, CancellationToken ct)
     {
+        if (imdbIds.Count == 0) return new Dictionary<string, RatingRow?>(StringComparer.Ordinal);
+
         var client = factory.CreateClient("imdb-live");
         client.Timeout = TimeSpan.FromSeconds(12);
 
@@ -88,7 +103,7 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         req.Headers.TryAddWithoutValidation("Origin", "https://www.imdb.com");
         req.Headers.Referrer = new Uri("https://www.imdb.com/");
 
-        var query = $"query {{ title(id: \"{imdbId}\") {{ ratingsSummary {{ aggregateRating voteCount }} }} }}";
+        var query = BuildGraphQlQuery(imdbIds);
         req.Content = new StringContent(JsonSerializer.Serialize(new { query }), Encoding.UTF8, "application/json");
 
         using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
@@ -97,22 +112,66 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
 
-        if (doc.RootElement.TryGetProperty("errors", out var errors) && errors.ValueKind == JsonValueKind.Array && errors.GetArrayLength() > 0)
+        if (doc.RootElement.TryGetProperty("errors", out var errors) &&
+            errors.ValueKind == JsonValueKind.Array &&
+            errors.GetArrayLength() > 0)
             throw new InvalidDataException("IMDb GraphQL returned errors: " + errors.GetRawText());
 
-        if (!doc.RootElement.TryGetProperty("data", out var data) ||
-            data.ValueKind != JsonValueKind.Object ||
-            !data.TryGetProperty("title", out var title) ||
-            title.ValueKind != JsonValueKind.Object ||
-            !title.TryGetProperty("ratingsSummary", out var summary) ||
-            summary.ValueKind != JsonValueKind.Object)
-            return null;
+        if (!doc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("IMDb GraphQL response has no data object.");
 
-        var rating = ReadDouble(summary, "aggregateRating");
-        var votes = ReadLong(summary, "voteCount");
-        return rating is > 0 and <= 10 && votes is > 0
-            ? new RatingRow(rating.Value, votes.Value)
-            : null;
+        var result = new Dictionary<string, RatingRow?>(StringComparer.Ordinal);
+        for (var i = 0; i < imdbIds.Count; i++)
+        {
+            var imdbId = imdbIds[i];
+            var alias = "t" + i.ToString(CultureInfo.InvariantCulture);
+
+            if (!data.TryGetProperty(alias, out var title))
+                continue;
+
+            if (title.ValueKind == JsonValueKind.Null)
+            {
+                result[imdbId] = null;
+                continue;
+            }
+
+            if (title.ValueKind != JsonValueKind.Object ||
+                !title.TryGetProperty("ratingsSummary", out var summary) ||
+                summary.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                result[imdbId] = null;
+                continue;
+            }
+
+            if (summary.ValueKind != JsonValueKind.Object)
+                throw new InvalidDataException($"IMDb GraphQL returned invalid ratingsSummary for {imdbId}.");
+
+            var rating = ReadDouble(summary, "aggregateRating");
+            var votes = ReadLong(summary, "voteCount");
+            result[imdbId] = rating is > 0 and <= 10 && votes is > 0
+                ? new RatingRow(rating.Value, votes.Value)
+                : null;
+        }
+
+        return result;
+    }
+
+    internal static string BuildGraphQlQuery(IReadOnlyList<string> imdbIds)
+    {
+        var sb = new StringBuilder("query {");
+        for (var i = 0; i < imdbIds.Count; i++)
+        {
+            var imdbId = imdbIds[i];
+            if (!System.Text.RegularExpressions.Regex.IsMatch(imdbId, "^tt\\d+$"))
+                throw new ArgumentException($"Invalid IMDb id: {imdbId}", nameof(imdbIds));
+
+            sb.Append(' ')
+              .Append('t').Append(i.ToString(CultureInfo.InvariantCulture))
+              .Append(": title(id: \"").Append(imdbId)
+              .Append("\") { ratingsSummary { aggregateRating voteCount } }");
+        }
+        sb.Append(" }");
+        return sb.ToString();
     }
 
     private static double? ReadDouble(JsonElement element, string property)
@@ -191,7 +250,8 @@ sealed class ImdbLiveFallback(IHttpClientFactory factory, AppConfig cfg, ILogger
         cmd.Parameters.AddWithValue("$id", imdbId);
         cmd.Parameters.AddWithValue("$rating", rating is null ? DBNull.Value : rating.Rating);
         cmd.Parameters.AddWithValue("$votes", rating is null ? DBNull.Value : rating.Votes);
-        cmd.Parameters.AddWithValue("$expires", DateTimeOffset.UtcNow.AddHours(CacheHours).ToString("O"));
+        var cacheHours = rating is null ? NegativeCacheHours : PositiveCacheHours;
+        cmd.Parameters.AddWithValue("$expires", DateTimeOffset.UtcNow.AddHours(cacheHours).ToString("O"));
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
